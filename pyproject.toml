@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantnet-plugins"
+version = "1.0.0"
+authors = [
+  { name="ESnet", email="quantum@es.net" },
+]
+description = "Plugins for the Quant-Net Control Plane"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+license = "BSD-3-Clause-LBNL"
+license-files = ["LICEN[CS]E*"]
+
+[project.urls]
+Homepage = "https://github.com/quant-net/quant-net-plugins"
+
+[tool.setuptools]
+packages = ["quantnet_plugins"]
+package-dir = { "quantnet_plugins" = "plugins" }
+include-package-data = true
+
+#[tool.setuptools.packages.find]
+#include = ["plugins", "plugins.*"]
+
+[tool.setuptools.package-data]
+"quantnet_plugins" = ["schema/*"]
