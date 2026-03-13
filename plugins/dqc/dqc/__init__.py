@@ -1,10 +1,11 @@
-import logging
 from quantnet_controller.common.plugin import ProtocolPlugin, PluginType
 from quantnet_controller.common.request import RequestManager, RequestType, RequestParameter
+from quantnet_controller.common.constants import Constants
 from quantnet_mq import Code
 from quantnet_mq.schema.models import dqc, Status as responseStatus
 from logic import DQCLogic
 
+import logging
 logger = logging.getLogger(__name__)
 
 
@@ -127,11 +128,12 @@ class DQC(ProtocolPlugin):
             self.request_manager.translator.exp_defs.append(DynamicExp)
 
             try:
-                # 4. Get startTime from RequestManager's translator
-                # This call is locked and calculates the same time the schedule() call will use
                 start_time, slots = await self.request_manager.translator.get_slots_to_allocate(
                     agent_ids, DynamicExp
                 )
+
+                # 4. Enrich allocations using the experiment's own self-description
+                allocations = DynamicExp.get_allocations(slots, Constants.SLOTSIZE.total_seconds())
 
                 # 5. Create and schedule request
                 parameters = RequestParameter(exp_name=exp_name, path=agent_ids)
@@ -147,7 +149,7 @@ class DQC(ProtocolPlugin):
                         code=Code.OK.value, value=Code.OK.name, message="DQC execution completed"
                     ),
                     rid=rid,
-                    data={"startTime": start_time, "allocations": slots, "routes": routes},
+                    data={"startTime": start_time, "allocations": allocations, "routes": routes},
                 )
             finally:
                 # cleanup
