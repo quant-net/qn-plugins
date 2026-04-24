@@ -32,25 +32,30 @@ class DQCLogic:
                 pairs.add(tuple(sorted([src, dst])))
         return list(pairs)
 
-    @staticmethod
-    def extract_bsm_nodes_from_path(path):
-        """Extract BSMNode IDs from a router Path object.
+    def extract_bsm_nodes_from_path(self, path):
+        """Return the first available BSMNode ID from a router Path object.
 
-        Iterates over *path.hops* and collects every node whose
-        ``systemSettings.type`` equals ``"BSMNode"``.
+        Iterates over *path.hops* in order and returns a single-element list
+        containing the first BSM node whose latest agent state is ``IN_SPEC``.
+        If no BSM node is available, returns an empty list.
 
         :param path: Path object returned by ``router.find_path``.
         :type path: quantnet_controller.common.plugin.Path
-        :returns: List of BSMNode ID strings found on the path.
+        :returns: List with at most one BSMNode ID string.
         :rtype: list[str]
         """
-        bsm_ids = []
         if path is None or path.hops is None:
-            return bsm_ids
+            return []
         for hop in path.hops:
-            if hasattr(hop, 'systemSettings') and hop.systemSettings.type == 'BSMNode':
-                bsm_ids.append(str(hop.systemSettings.ID))
-        return bsm_ids
+            if not (hasattr(hop, 'systemSettings') and hop.systemSettings.type == 'BSMNode'):
+                continue
+            bsm_id = str(hop.systemSettings.ID)
+            state = self.context.rm.get_node_state(bsm_id)
+            if state and state.get('value') == 'IN_SPEC':
+                logger.debug(f"Selected BSM node {bsm_id} (IN_SPEC)")
+                return [bsm_id]
+            logger.debug(f"Skipping BSM node {bsm_id} (state={state.get('value') if state else 'unknown'})")
+        return []
 
     def build_dynamic_experiment(self, exp_name, commands_list, node_types=None):
         """Build a dynamic Experiment class from the commands list.
