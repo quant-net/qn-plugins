@@ -1,7 +1,6 @@
 import logging
 from quantnet_controller.common.plugin import ProtocolPlugin, PluginType, Path
-from quantnet_controller.common.utils import generate_uuid
-from quantnet_controller.common.request import RequestManager, RequestType
+from quantnet_controller.common.request import RequestManager, RequestType, RequestParameter
 from quantnet_mq import Code
 from quantnet_mq.schema.models import bsm, Status as responseStatus, QNode, BSMNode
 from quantnet_controller.core import AbstractDatabase as DB
@@ -62,10 +61,7 @@ class BSM(ProtocolPlugin):
             rc = Code.INVALID_ARGUMENT
             return bsm.bsmResponse(status=responseStatus(code=rc.value, value=Code(rc).name, message=f"{e}"))
 
-        parameters = {"exp_name": "BSM",
-                      "path": p,
-                      # Any additional experiment execution parameters would go here
-                      }
+        parameters = RequestParameter(exp_name="BSM", path=p.to_node_ids())
 
         # Create Request object through RequestManager
         # Payload encapsulates the plugin request (nodes, rate, duration are already in payload)
@@ -78,7 +74,7 @@ class BSM(ProtocolPlugin):
             status=responseStatus(code=rc.value,
                                   value=Code(rc).name,
                                   message=f"{path}"),
-                                  rtype=str(payload.cmd),
+            rtype=str(payload.cmd),
             rid=req.id
         )
 
@@ -93,12 +89,11 @@ class BSM(ProtocolPlugin):
             # Get request with experiment result
             req = await self.request_manager.get_request(rid, include_result=True)
 
+            if req is None:
+                raise Exception("Request ID not found")
+
             return bsm.bsmResponse(
-                status=responseStatus(
-                    code=req.status_code.value,
-                    value=req.status_code.name,
-                    message=req.status_message
-                ),
+                status=req.status,
                 rid=rid,
                 data=getattr(req, 'experiment_data', None),
             )

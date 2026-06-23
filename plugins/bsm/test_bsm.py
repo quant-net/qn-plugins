@@ -14,7 +14,7 @@ class MyBSM():
 
     async def do_bsm(self):
         msg = {"nodes": self._nodes, "rate": self._rate, "duration": self._duration, 'exp_param': {"use_db": True}}
-        return json.loads(await self._client.call("bsmRequest", msg, timeout=20.0))
+        return json.loads(await self._client.call("bsmRequest", msg, timeout=120.0))
 
     async def do_query(self, rid):
         msg = {"rid": rid}
@@ -35,11 +35,11 @@ class MyBSM():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        nodes = sys.argv[1]
+        nodes = sys.argv[1].split(",")
         rate = sys.argv[2]
         duration = sys.argv[3]
     else:
-        nodes = ["LBNL-Q"]
+        nodes = ["LBNL-Q", "UCB-Q", "LBNL-BSM"]
         rate = 100
         duration = 30
     asyncio.run(MyBSM(nodes, rate, duration).main())
