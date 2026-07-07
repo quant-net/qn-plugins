@@ -3,7 +3,8 @@ import os
 import sys
 from unittest.mock import MagicMock
 from datetime import timedelta
-
+# Import logic
+from dqc.logic import DQCLogic
 # --- MOCKING MODULES BEFORE IMPORT ---
 
 mock_exp_defs = MagicMock()
@@ -55,9 +56,6 @@ sys.modules["quantnet_mq.schema.models"] = MagicMock()
 # The plugin runtime adds the plugin folder to sys.path; replicate that here.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dqc"))
 
-# Import logic
-from dqc.logic import DQCLogic
-
 
 class TestDQCLogic(unittest.TestCase):
     def setUp(self):
@@ -95,7 +93,7 @@ class TestDQCLogic(unittest.TestCase):
         dynamic_experiment = logic.build_dynamic_experiment("TestExp", commands_list)
 
         self.assertEqual(dynamic_experiment.name, "TestExp")
-        agent_ids = ["LBNL-A", "LBNL-B"]
+        # agent_ids = ["LBNL-A", "LBNL-B"]
 
         # Check Agent LBNL-A Sequences
         # Note: build_dynamic_experiment doesn't return agent_ids as a separate list anymore,
