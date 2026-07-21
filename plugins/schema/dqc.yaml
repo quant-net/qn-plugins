@@ -1,0 +1,107 @@
+---
+asyncapi: "2.6.0"
+id: "urn:gov:quant-net"
+info:
+  description: "Quant-Net RPC Distributed Quantum Computing (DQC) Protocol"
+  title: "RPC DQC Endpoint"
+  version: "2.0.0"
+components:
+  messages:
+    RequestMessage:
+      name: dqcRequest
+      messageId: dqc.request.id
+      payload:
+        "$ref": "#/components/schemas/DQCRequest"
+    ResponseMessage:
+      name: dqcResponse
+      messageId: dqc.response.id
+      payload:
+        "$ref": "#/components/schemas/DQCResponse"
+  schemas:
+    DQCRequest:
+      title: dqcRequest
+      type: object
+      required:
+        - cmd
+        - agentId
+        - payload
+      properties:
+        cmd:
+          type: string
+        agentId:
+          type: string
+        payload:
+          type: object
+          required:
+            - circuit_mode
+          properties:
+            circuit_mode:
+              type: string
+              enum: [cisco, tket]
+              description: >
+                Which frontend produced the partitioned commands.
+                'cisco' = QASM3 (QASM3Frontend), 'tket' = tket (TketFrontend).
+            partitioned_commands:
+              type: object
+              description: >
+                Per-QPU command lists as produced by frontend.parse(qpu_info).
+                Keys are 1-based integer QPU IDs (as strings); values are
+                ordered lists of command dicts with fields: op, qubits, params,
+                original_qubits, is_remote, start_label, end_label, plus
+                op-specific fields (e.g. role, peer_qpu_id for entanglement_gen;
+                data_qubit, link_qpu_id for ejpp_start, etc.).
+                If omitted, circuit_file or circuit_content must be provided
+                so the plugin can parse the circuit itself.
+              additionalProperties:
+                type: array
+                items:
+                  type: object
+            circuit_file:
+              type: string
+              description: >
+                Path to the circuit source file on the controller filesystem.
+                For circuit_mode 'cisco': a .qasm file path.
+                For circuit_mode 'tket': a dist_commands.txt path.
+                Used when partitioned_commands is not provided.
+            circuit_content:
+              type: string
+              description: >
+                Inline circuit source text (alternative to circuit_file).
+                The plugin writes this to a temp file before parsing.
+                Used when partitioned_commands is not provided.
+    DQCResponse:
+      title: dqcResponse
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          $ref: "qn-schema:objects/objects.yaml#/components/schemas/Status"
+        rid:
+          type: string
+        data:
+          type: object
+          description: Scheduling allocation details, route information, and simulation results.
+          properties:
+            startTime:
+              type: number
+              description: "Scheduled experiment start time"
+            allocations:
+              type: object
+              description: "Timeslot allocation details per agent"
+            routes:
+              type: object
+              description: >
+                Network routes between cross-QPU pairs found during scheduling.
+                Keyed by 'src->dst'; value is an ordered list of node IDs on
+                the path (or null if no route was found).
+              additionalProperties:
+                type: array
+                items:
+                  type: string
+            simulation:
+              type: object
+              description: >
+                Results from qnpack NetSquid simulation.
+                Present when labeled commands were forwarded to the simulator.
+defaultContentType: application/json
