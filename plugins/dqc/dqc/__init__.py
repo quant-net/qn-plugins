@@ -36,7 +36,7 @@ from ir_converter import labeled_ir_to_timeslot_schedule
 # qnpack imports — pure Python, no NetSquid dependency
 from qnpack.dqc.frontends import load_frontend
 from qnpack.dqc.labeling import label_and_build_maps
-from qnpack.dqc.validation import validate_commands
+from qnpack.dqc.models.validation import validate_commands
 
 logger = logging.getLogger(__name__)
 
