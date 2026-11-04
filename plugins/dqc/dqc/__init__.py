@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import tempfile
+import configparser
 
 from munch import Munch
 
@@ -33,10 +34,28 @@ from logic import DQCLogic
 from topology_adapter import get_qpu_info_from_topology
 from ir_converter import labeled_ir_to_timeslot_schedule
 
+# EGP Sequence leaf classes — imported directly so DQC can embed real hardware
+# entanglement sequences into the unified DynamicExperiment without an MQTT
+# round-trip through the EGP plugin.  If the EGP plugin is not installed the
+# import fails loudly here at load time rather than silently at request time.
+try:
+    from egp.experiment import QnodeEGP, BSMnodeEGP
+    _EGP_AVAILABLE = True
+except ImportError:
+    logger_tmp = __import__("logging").getLogger(__name__)
+    logger_tmp.warning(
+        "[DQC] egp.experiment not importable — EGP sequence injection disabled. "
+        "entanglement_gen blocks will fall back to BlockSequence placeholders."
+    )
+    QnodeEGP = None
+    BSMnodeEGP = None
+    _EGP_AVAILABLE = False
+
 # qnpack imports — pure Python, no NetSquid dependency
 from qnpack.dqc.frontends import load_frontend
 from qnpack.dqc.labeling import label_and_build_maps
 from qnpack.dqc.models.validation import validate_commands
+from qnpack.dqc.protocols.controller import insert_pre_entanglement_commands
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +79,13 @@ def _to_plain(obj):
 
 
 class DQC(ProtocolPlugin):
+    # Default values for scheduling constants. These are overridden by dqc.cfg if present.
+    _DEFAULT_PRE_SCHEDULE_ENTANGLEMENT = True
+    _DEFAULT_EXPECTED_ENT_LATENCY_NS = 1_000_000      # 1 ms — expected Bell-pair gen time
+    _DEFAULT_ONE_Q_GATE_DURATION_NS = 5000            # ns per single-qubit gate
+    _DEFAULT_TWO_Q_GATE_DURATION_NS = 10700           # ns per two-qubit gate
+    _DEFAULT_DQC_TIMESLOT_MS = 3                      # milliseconds per DQC timeslot
+
     def __init__(self, context):
         super().__init__("dqc", PluginType.PROTOCOL, context)
         self._server_commands = [
@@ -67,8 +93,11 @@ class DQC(ProtocolPlugin):
         ]
         self.ctx = context
 
-        # Initialize logic handler
-        self.logic = DQCLogic(context)
+        # Load configuration from dqc.cfg
+        self._load_config()
+
+        # Initialize logic handler with DQC timeslot value
+        self.logic = DQCLogic(context, dqc_timeslot_ms=self.DQC_TIMESLOT_MS)
 
         # Initialize RequestManager
         self.request_manager = RequestManager(
@@ -83,6 +112,154 @@ class DQC(ProtocolPlugin):
 
     def reset(self):
         pass
+
+    # ── Configuration loading ─────────────────────────────────────────────────
+
+    def _load_config(self):
+        """Load DQC scheduling constants from dqc.cfg, or use defaults if missing.
+
+        Configuration is read from plugins/dqc/dqc.cfg (one level up from this file).
+        If the file is missing or any option is absent, hardcoded defaults are used.
+
+        Sets instance attributes:
+        - PRE_SCHEDULE_ENTANGLEMENT (bool)
+        - EXPECTED_ENT_LATENCY_NS (int)
+        - ONE_Q_GATE_DURATION_NS (int)
+        - TWO_Q_GATE_DURATION_NS (int)
+        - DQC_TIMESLOT_MS (int)
+        """
+        # Resolve dqc.cfg path: one level up from this __init__.py (in plugins/dqc/)
+        plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        config_file = os.path.join(plugin_dir, "dqc.cfg")
+
+        # Set defaults
+        self.PRE_SCHEDULE_ENTANGLEMENT = self._DEFAULT_PRE_SCHEDULE_ENTANGLEMENT
+        self.EXPECTED_ENT_LATENCY_NS = self._DEFAULT_EXPECTED_ENT_LATENCY_NS
+        self.ONE_Q_GATE_DURATION_NS = self._DEFAULT_ONE_Q_GATE_DURATION_NS
+        self.TWO_Q_GATE_DURATION_NS = self._DEFAULT_TWO_Q_GATE_DURATION_NS
+        self.DQC_TIMESLOT_MS = self._DEFAULT_DQC_TIMESLOT_MS
+
+        # If config file exists, read and override defaults
+        if os.path.exists(config_file):
+            config = configparser.ConfigParser()
+            try:
+                config.read(config_file)
+                if config.has_section("scheduling"):
+                    if config.has_option("scheduling", "pre_schedule_entanglement"):
+                        self.PRE_SCHEDULE_ENTANGLEMENT = config.getboolean("scheduling", "pre_schedule_entanglement")
+                    if config.has_option("scheduling", "expected_ent_latency_ns"):
+                        self.EXPECTED_ENT_LATENCY_NS = config.getint("scheduling", "expected_ent_latency_ns")
+                    if config.has_option("scheduling", "one_q_gate_duration_ns"):
+                        self.ONE_Q_GATE_DURATION_NS = config.getint("scheduling", "one_q_gate_duration_ns")
+                    if config.has_option("scheduling", "two_q_gate_duration_ns"):
+                        self.TWO_Q_GATE_DURATION_NS = config.getint("scheduling", "two_q_gate_duration_ns")
+                    if config.has_option("scheduling", "dqc_timeslot_ms"):
+                        self.DQC_TIMESLOT_MS = config.getint("scheduling", "dqc_timeslot_ms")
+
+                logger.info(
+                    "[DQC] Loaded configuration from %s: "
+                    "pre_schedule=%s, ent_latency=%d ns, 1q_gate=%d ns, 2q_gate=%d ns, timeslot=%d ms",
+                    config_file,
+                    self.PRE_SCHEDULE_ENTANGLEMENT,
+                    self.EXPECTED_ENT_LATENCY_NS,
+                    self.ONE_Q_GATE_DURATION_NS,
+                    self.TWO_Q_GATE_DURATION_NS,
+                    self.DQC_TIMESLOT_MS,
+                )
+            except (configparser.Error, ValueError) as e:
+                logger.warning(
+                    "[DQC] Failed to parse config file %s: %s; using defaults",
+                    config_file, e
+                )
+        else:
+            logger.debug("[DQC] Config file %s not found; using defaults", config_file)
+
+    # ── Private entanglement capability helpers ───────────────────────────────
+
+    def _read_entanglement_capabilities(self, agent_ids):
+        """Read entanglement capabilities from agent registration (MongoDB).
+
+        Sync method — reads from ResourceManager without RPC.
+        
+        :param agent_ids: List of agent ID strings.
+        :returns: {agent_id: {"continuous_entanglement": bool, "prefill_cost_per_pair": int}}
+            Agents with missing data default to {"continuous_entanglement": False, "prefill_cost_per_pair": 0}
+        :rtype: dict
+        """
+        results = {}
+        for agent_id in agent_ids:
+            try:
+                node_data = self.ctx.rm.get_nodes(agent_id)
+                if node_data and isinstance(node_data, (list, tuple)) and len(node_data) > 0:
+                    node = node_data[0]
+                    # capabilities is a schema Literal object; convert to dict
+                    caps_obj = getattr(node, "capabilities", None)
+                    caps = caps_obj.as_dict() if caps_obj is not None and hasattr(caps_obj, "as_dict") else {}
+                    results[agent_id] = {
+                        "continuous_entanglement": caps.get("continuous_entanglement", False),
+                        "prefill_cost_per_pair": caps.get("prefill_cost_per_pair", 0),
+                    }
+                else:
+                    results[agent_id] = {
+                        "continuous_entanglement": False,
+                        "prefill_cost_per_pair": 0,
+                    }
+            except Exception as e:
+                logger.warning(
+                    "[DQC] Failed to read entanglement capabilities for %s: %s; "
+                    "defaulting to on-demand entanglement",
+                    agent_id, e
+                )
+                results[agent_id] = {
+                    "continuous_entanglement": False,
+                    "prefill_cost_per_pair": 0,
+                }
+        
+        logger.info(
+            "[DQC] Entanglement capabilities: %s",
+            {k: v.get("continuous_entanglement", False) for k, v in results.items()},
+        )
+        return results
+
+    def _compute_prefill_map(self, commands, qpu_agent_ids, capabilities, use_continuous):
+        """Compute dynamic prefill_map from circuit entanglement operations.
+
+        Counts entanglement_gen operations per QPU agent and multiplies by
+        prefill_cost_per_pair from capabilities to determine time reservations.
+
+        :param commands: Flat list of command dicts from timeslot schedule.
+        :param qpu_agent_ids: List of QPU agent ID strings.
+        :param capabilities: Dict from _read_entanglement_capabilities().
+        :param use_continuous: Boolean — whether continuous entanglement is active.
+        :returns: {agent_id: prefill_time_slots} — empty dict if use_continuous is False.
+        :rtype: dict
+        """
+        prefill_map = {}
+        
+        if not use_continuous:
+            # On-demand entanglement — no prefill needed
+            return prefill_map
+        
+        # Count entanglement_gen operations per agent
+        ent_counts = {}
+        for cmd in commands:
+            if cmd.get("op") == "entanglement_gen":
+                # entanglement_gen commands involve multiple QPUs; count for each
+                for qpu in cmd.get("qpus_involved", []):
+                    qpu_id = str(qpu)
+                    ent_counts[qpu_id] = ent_counts.get(qpu_id, 0) + 1
+        
+        # Compute prefill reservation per agent
+        for agent_id in qpu_agent_ids:
+            count = ent_counts.get(agent_id, 0)
+            cost = capabilities.get(agent_id, {}).get("prefill_cost_per_pair", 0)
+            prefill_map[agent_id] = count * cost
+        
+        logger.info(
+            "[DQC] Dynamic prefill_map computed: %s",
+            {k: v for k, v in prefill_map.items() if v > 0}
+        )
+        return prefill_map
 
     # ── Public request handler ────────────────────────────────────────────────
 
@@ -107,6 +284,9 @@ class DQC(ProtocolPlugin):
             # ── 2. Validate + Label via qnpack ────────────────────────────────
             labeled, process_maps = self._label_commands(partitioned)
 
+            # ── 2b. Pre-schedule entanglement commands ────────────────────────
+            pre_ent_stats = self._pre_schedule(labeled)
+
             # ── 3. Convert labeled IR → flat timeslot schedule ────────────────
             qpu_info, qpu_id_to_label, label_to_qpu_id, bsm_nodes, raw_topology = get_qpu_info_from_topology(self.ctx)
             commands = labeled_ir_to_timeslot_schedule(labeled, process_maps, qpu_id_to_label)
@@ -126,15 +306,24 @@ class DQC(ProtocolPlugin):
                         _path_objects[route_key] = p
                         logger.info(f"Route found {route_key}: {routes[route_key]}")
                     except Exception as e:
-                        logger.warning(f"Could not find route {route_key}: {e}")
-                        routes[route_key] = None
-                        _path_objects[route_key] = None
+                        logger.error(f"Could not find valid resources for {route_key}: {e}")
+                        raise Exception(f"Could not find valid resources for {route_key}: {e}")
             else:
                 logger.debug("No router plugin available or no cross-QPU pairs; skipping route discovery")
 
-            # ── 3c. Extract BSM nodes and build synthetic BSM commands ─────────
+            # ── 3c. Build egp_sequences map and collect BSM agent IDs ─────────
+            # Instead of injecting synthetic BSM command dicts, we build a map
+            # { agent_id: { entanglement_label: Sequence class } } that
+            # build_dynamic_experiment() uses to insert real EGP Sequence
+            # objects (QnodeEGP / BSMnodeEGP) at the correct position in each
+            # agent's sequence list.  This produces a single unified
+            # DynamicExperiment whose allocations cover both local gate blocks
+            # and entanglement sequences in one get_slots_to_allocate() call.
+            #
+            # If the EGP plugin is unavailable, egp_sequences stays empty and
+            # build_dynamic_experiment falls back to BlockSequence placeholders.
             node_types = {}
-            bsm_commands = []
+            egp_sequences = {}   # { agent_id: { ent_label: Sequence class } }
             _seen_bsm_ids = set()
 
             for route_key, path_obj in _path_objects.items():
@@ -143,31 +332,70 @@ class DQC(ProtocolPlugin):
                     continue
 
                 src_qpu, dst_qpu = route_key.split("->") if "->" in route_key else (None, None)
-                pair_cmds = [
-                    c
+
+                # Collect all entanglement labels for this QPU pair so each
+                # Bell-pair generation gets its own EGP sequence entry.
+                pair_ent_labels = [
+                    c["entanglement_label"]
                     for c in commands
-                    if len(c.get("qpus_involved") or []) >= 2
+                    if c.get("op") == "entanglement_gen"
                     and src_qpu in [str(q) for q in c.get("qpus_involved", [])]
                     and dst_qpu in [str(q) for q in c.get("qpus_involved", [])]
+                    and c.get("entanglement_label")
                 ]
+
+                if not pair_ent_labels:
+                    logger.debug(
+                        f"[DQC] No entanglement_gen labels found for route {route_key}; "
+                        "skipping EGP sequence injection for this pair"
+                    )
+                    continue
 
                 for bsm_id in bsm_ids:
                     node_types[bsm_id] = "BSMNode"
                     if bsm_id in _seen_bsm_ids:
                         continue
                     _seen_bsm_ids.add(bsm_id)
-                    for cmd in pair_cmds:
-                        bsm_cmd = dict(cmd)
-                        bsm_cmd["qpu_id"] = bsm_id
-                        bsm_cmd["node_type"] = "BSMNode"
-                        bsm_commands.append(bsm_cmd)
-                    logger.info(f"Injected {len(pair_cmds)} BSM command(s) for " f"node {bsm_id} on route {route_key}")
 
-            if bsm_commands:
-                commands = commands + bsm_commands
+                    for label in pair_ent_labels:
+                        if _EGP_AVAILABLE:
+                            egp_sequences.setdefault(src_qpu, {})[label] = QnodeEGP
+                            egp_sequences.setdefault(dst_qpu, {})[label] = QnodeEGP
+                            egp_sequences.setdefault(bsm_id, {})[label] = BSMnodeEGP
+                        logger.info(
+                            f"[DQC] EGP sequence mapped for route {route_key} "
+                            f"label={label} bsm={bsm_id} "
+                            f"(egp_available={_EGP_AVAILABLE})"
+                        )
 
-            all_agent_ids = sorted(list(set(str(c.get("qpu_id")) for c in commands)))
+            # agent_ids now includes BSM nodes that appear in egp_sequences
+            # (build_dynamic_experiment handles pure-EGP agents separately).
+            all_agent_ids = sorted(
+                set(str(c.get("qpu_id")) for c in commands) | set(egp_sequences.keys())
+            )
             agent_ids = all_agent_ids
+
+            # ── 3d. Determine entanglement mode and compute prefill_map ────────
+            # Read entanglement capabilities from agent registration (MongoDB).
+            # Capability names: continuous_entanglement (bool), prefill_cost_per_pair (int).
+            # These are static hardware properties set at agent registration.
+            qpu_agent_ids = sorted(list(set(str(c.get("qpu_id")) for c in commands)))
+            capabilities = self._read_entanglement_capabilities(qpu_agent_ids)
+            
+            # Determine entanglement mode: check if all QPU agents support continuous
+            has_continuous_capable = any(
+                capabilities.get(aid, {}).get("continuous_entanglement", False)
+                for aid in qpu_agent_ids
+            )
+            use_continuous = has_continuous_capable
+            logger.info(
+                "[DQC] Entanglement mode: %s (continuous_capable=%s)",
+                "continuous" if use_continuous else "on-demand",
+                has_continuous_capable
+            )
+            
+            # Compute dynamic prefill_map from circuit entanglement operations
+            prefill_map = self._compute_prefill_map(commands, qpu_agent_ids, capabilities, use_continuous)
 
             # ── Resolve rid ───────────────────────────────────────────────────
             rid = getattr(dqc_req.payload, "rid", None) or request.get("id")
@@ -178,7 +406,11 @@ class DQC(ProtocolPlugin):
 
             # ── 4. Build dynamic experiment structure ─────────────────────────
             exp_name = f"DQC_{rid}"
-            DynamicExp = self.logic.build_dynamic_experiment(exp_name, commands, node_types=node_types)
+            DynamicExp = self.logic.build_dynamic_experiment(
+                exp_name, commands, node_types=node_types, egp_sequences=egp_sequences,
+                prefill_map=prefill_map if use_continuous else {}
+            )
+            
             if not DynamicExp:
                 raise Exception("No commands to process")
 
@@ -193,10 +425,15 @@ class DQC(ProtocolPlugin):
                 parameters = RequestParameter(exp_name=exp_name, path=agent_ids)
                 req_obj = self.request_manager.new_request(payload=dqc_req, parameters=parameters, rid=rid)
 
-                await self.request_manager.schedule(req_obj, blocking=True)
+                rc = await self.request_manager.schedule(req_obj, blocking=True)
+                if isinstance(rc, Code) and rc != Code.OK:
+                    raise Exception(getattr(req_obj, "error", None) or f"DQC execution failed with status {rc.name}")
 
                 # ── 6. Build simulation payload for caller ────────────────────
-                sim_payload = self._build_sim_payload(labeled, process_maps, raw_topology, frontend_meta)
+                sim_payload = self._build_sim_payload(
+                    labeled, process_maps, raw_topology, frontend_meta,
+                    pre_scheduled=(pre_ent_stats is not None),
+                )
 
                 return dqc.dqcResponse(
                     status=responseStatus(code=Code.OK.value, value=Code.OK.name, message="DQC execution completed"),
@@ -324,7 +561,50 @@ class DQC(ProtocolPlugin):
         )
         return labeled, process_maps
 
-    def _build_sim_payload(self, labeled, process_maps, topology, frontend_meta=None):
+    def _pre_schedule(self, labeled):
+        """Apply pre-entanglement scheduling to labeled commands.
+
+        Moves ``entanglement_gen`` commands earlier in each QPU's command list
+        to overlap Bell-pair generation latency with local gate execution.
+        The commands dict is mutated in place.
+
+        :param labeled: ``{int_qpu_id: [cmd_dict, ...]}`` — mutated in place.
+        :returns: Stats dict from ``insert_pre_entanglement_commands()``,
+            or ``None`` if pre-scheduling is disabled.
+        :rtype: dict or None
+        """
+        if not self.PRE_SCHEDULE_ENTANGLEMENT:
+            return None
+
+        stats = insert_pre_entanglement_commands(
+            labeled,
+            expected_ent_latency_ns=self.EXPECTED_ENT_LATENCY_NS,
+            one_q_gate_duration_ns=self.ONE_Q_GATE_DURATION_NS,
+            two_q_gate_duration_ns=self.TWO_Q_GATE_DURATION_NS,
+        )
+
+        total = stats["total_pairs"]
+        moved = stats["moved_pairs"]
+        latency = stats["expected_latency_ns"]
+        logger.info(
+            f"[DQC] Pre-entanglement scheduling: {moved}/{total} pairs moved "
+            f"(expected latency={latency:,.0f} ns)"
+        )
+        if stats["moves"]:
+            total_gate_time = sum(
+                min(m["gate_time_ns"][0], m["gate_time_ns"][1])
+                for m in stats["moves"]
+            )
+            avg_overlap = total_gate_time / len(stats["moves"])
+            coverage = (avg_overlap / latency * 100) if latency > 0 else 0
+            logger.info(
+                f"[DQC] Avg gate-time overlap: {avg_overlap:,.0f} ns "
+                f"({coverage:.1f}% of expected latency)"
+            )
+
+        return stats
+
+    def _build_sim_payload(self, labeled, process_maps, topology, frontend_meta=None, pre_scheduled=False):
         """Build the JSON-serializable payload for qnpack simulation.
 
         Returns a dict the caller can write to a file and pass to
@@ -353,4 +633,6 @@ class DQC(ProtocolPlugin):
                 payload["num_output_bits"] = frontend_meta["num_output_bits"]
             if frontend_meta.get("output_reg_name"):
                 payload["output_reg_name"] = frontend_meta["output_reg_name"]
+        if pre_scheduled:
+            payload["pre_scheduled"] = True
         return payload

@@ -11,6 +11,9 @@ authors = [
 description = "Plugins for the Quant-Net Control Plane"
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = [
+    "munch",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
