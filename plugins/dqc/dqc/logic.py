@@ -65,7 +65,7 @@ class DQCLogic:
             logger.debug(f"Skipping BSM node {bsm_id} (state={state.get('value') if state else 'unknown'})")
         return []
 
-    def build_dynamic_experiment(self, exp_name, commands_list, node_types=None, egp_sequences=None):
+    def build_dynamic_experiment(self, exp_name, commands_list, node_types=None, egp_sequences=None, prefill_map=None):
         """Build a dynamic Experiment class from the commands list.
 
         Each generated sequence block will store its original commands in a
@@ -79,10 +79,9 @@ class DQCLogic:
         blocks and real hardware entanglement sequences in a single
         ``experiment.submit`` call per agent.
 
-        Prefill reservation (for continuous entanglement preparation) is now
-        handled transparently by the scheduler, which reads ``prefill_map``
-        from the experiment definition. The plugin computes prefill_map
-        dynamically based on circuit entanglement operations.
+        When ``prefill_map`` is provided, a prefill ``Sequence`` with name
+        ``"entanglement_prefill"`` is prepended to each agent's sequence list.
+        The translator then schedules it like any other sequence.
 
         :param exp_name: Unique name for the generated experiment class.
         :param commands_list: Flat list of command dicts (gate + entanglement).
@@ -95,11 +94,16 @@ class DQCLogic:
             directly instead of a ``BlockSequence``.  Pure-EGP agents (e.g. BSM
             nodes) that have no gate blocks in *commands_list* are also built
             from this dict.
+        :param prefill_map: Optional dict mapping agent IDs to prefill slot counts.
+            When provided, a prefill sequence is prepended to each agent's list.
         :returns: The generated Experiment class, or ``None`` if there is
             nothing to schedule.
         """
         if egp_sequences is None:
             egp_sequences = {}
+        
+        if prefill_map is None:
+            prefill_map = {}
 
         # Collect all agent IDs: those with gate commands plus any pure-EGP
         # agents (e.g. BSM nodes) that appear only in egp_sequences.
@@ -185,6 +189,20 @@ class DQCLogic:
                         "dependency": egp_deps,
                     })
                     pure_egp_seqs.append(EGPSeq)
+                
+                # Prepend prefill sequence if this agent has prefill slots
+                prefill_slots = prefill_map.get(agent_id, 0)
+                if prefill_slots > 0:
+                    PrefillSeq = type(f"Prefill_{agent_id}", (Sequence,), {
+                        "name": "entanglement_prefill",
+                        "class_name": "entanglement_prefill",
+                        "duration": Constants.SLOTSIZE * prefill_slots,
+                        "dependency": [],
+                    })
+                    if pure_egp_seqs:
+                        pure_egp_seqs[0].dependency = ["entanglement_prefill"]
+                    pure_egp_seqs.insert(0, PrefillSeq)
+                
                 DynamicAgentSeq.sequences = pure_egp_seqs
                 DynamicExperiment.agent_sequences.append(DynamicAgentSeq)
                 continue
@@ -285,6 +303,20 @@ class DQCLogic:
                 })
 
                 agent_sequences_list.append(BlockSequence)
+            
+            # Prepend prefill sequence if this agent has prefill slots
+            prefill_slots = prefill_map.get(agent_id, 0)
+            if prefill_slots > 0:
+                PrefillSeq = type(f"Prefill_{agent_id}", (Sequence,), {
+                    "name": "entanglement_prefill",
+                    "class_name": "entanglement_prefill",
+                    "duration": Constants.SLOTSIZE * prefill_slots,
+                    "dependency": [],
+                })
+                if agent_sequences_list:
+                    first_seq = agent_sequences_list[0]
+                    first_seq.dependency = ["entanglement_prefill"]
+                agent_sequences_list.insert(0, PrefillSeq)
 
             DynamicAgentSeq.sequences = agent_sequences_list
             DynamicExperiment.agent_sequences.append(DynamicAgentSeq)

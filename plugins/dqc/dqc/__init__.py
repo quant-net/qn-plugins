@@ -407,11 +407,10 @@ class DQC(ProtocolPlugin):
             # ── 4. Build dynamic experiment structure ─────────────────────────
             exp_name = f"DQC_{rid}"
             DynamicExp = self.logic.build_dynamic_experiment(
-                exp_name, commands, node_types=node_types, egp_sequences=egp_sequences
+                exp_name, commands, node_types=node_types, egp_sequences=egp_sequences,
+                prefill_map=prefill_map if use_continuous else {}
             )
             
-            # Set the computed prefill_map on the experiment for the scheduler to read
-            DynamicExp.prefill_map = prefill_map if use_continuous else {}
             if not DynamicExp:
                 raise Exception("No commands to process")
 
